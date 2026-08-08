@@ -22,8 +22,13 @@
 #include "TemporarySummon.h"
 #include "PassiveAI.h"
 #include "PetDefines.h"
+#include "DynamicObject.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include <algorithm>
 #include <limits>
+#include <unordered_map>
+#include <unordered_set>
 
 enum DruidSpells
 {
@@ -70,7 +75,15 @@ enum DruidSpells
     SPELL_DRUID_STAMPEDE_CAT_RANK_1         = 81021,
     SPELL_DRUID_STAMPEDE_CAT_STATE          = 109881,
     SPELL_DRUID_TIGER_S_FURY_ENERGIZE       = 51178,
+    SPELL_DRUID_CAT_FORM                    = 768,
     SPELL_DRUID_BEAR_FORM                   = 5487,
+    SPELL_DRUID_MOONKIN_FORM                = 24858,
+    SPELL_DRUID_INCARNATION_KING_OF_JUNGLE  = 102543,
+    SPELL_DRUID_INCARNATION_SON_OF_URSOC    = 102558,
+    SPELL_DRUID_INCARNATION_CHOSEN_OF_ELUNE = 102560,
+    SPELL_DRUID_INCARNATION_TREE_OF_LIFE    = 33891,
+    SPELL_DRUID_INCARNATION_AURA            = 117679,
+    SPELL_DRUID_CHOSEN_OF_ELUNE_DAMAGE      = 122114,
     SPELL_DRUID_SKULL_BASH_MANA_COST        = 82365,
     SPELL_DRUID_SKULL_BASH_INTERRUPT        = 93985,
     SPELL_DRUID_SKULL_BASH_CHARGE           = 93983,
@@ -112,6 +125,10 @@ enum DruidSpells
     SPELL_DRUID_GLYPH_OF_FRENZIED_REGEN     = 54810,
     SPELL_DRUID_FRENZIED_REGEN_HEAL_TAKE    = 124769,
     SPELL_DRUID_BEAR_HUG                    = 102795,
+    SPELL_DRUID_CENARION_WARD_HEAL          = 102352,
+    SPELL_DRUID_URSOLS_VORTEX               = 102793,
+    SPELL_DRUID_URSOLS_VORTEX_SNARE         = 127797,
+    SPELL_DRUID_URSOLS_VORTEX_JUMP_DEST     = 118283,
 };
 
 enum DruidCreatureIds
@@ -971,6 +988,310 @@ public:
     AuraScript* GetAuraScript() const override
     {
         return new spell_dru_living_seed_proc_AuraScript();
+    }
+};
+
+// 102793 - Ursol's Vortex
+// CREATE_AREATRIGGER is spawned as a DynamicObject (no aura). Apply the snare while
+// enemies remain inside and pull them back to the center the first time they leave.
+class spell_dru_ursols_vortex_dynamic : public DynamicObjectScript
+{
+public:
+    spell_dru_ursols_vortex_dynamic() : DynamicObjectScript("spell_dru_ursols_vortex_dynamic") { }
+
+    void OnUpdate(DynamicObject* dynObj, uint32 /*diff*/) override
+    {
+        if (dynObj->GetSpellId() != SPELL_DRUID_URSOLS_VORTEX)
+            return;
+
+        Unit* caster = dynObj->GetCaster();
+        if (!caster)
+            return;
+
+        float const radius = dynObj->GetRadius();
+        if (radius <= 0.0f)
+            return;
+
+        uint64 const dynGuid = dynObj->GetGUID();
+        std::unordered_set<uint64>& inside = _unitsInside[dynGuid];
+
+        std::list<Unit*> targets;
+        Skyfire::AnyAoETargetUnitInObjectRangeCheck check(dynObj, caster, radius);
+        Skyfire::UnitListSearcher<Skyfire::AnyAoETargetUnitInObjectRangeCheck> searcher(dynObj, targets, check);
+        dynObj->VisitNearbyObject(radius, searcher);
+
+        std::unordered_set<uint64> current;
+        for (Unit* target : targets)
+        {
+            if (!target)
+                continue;
+
+            current.insert(target->GetGUID());
+            if (!target->HasAura(SPELL_DRUID_URSOLS_VORTEX_SNARE, caster->GetGUID()))
+                caster->CastSpell(target, SPELL_DRUID_URSOLS_VORTEX_SNARE, true);
+        }
+
+        // DynObject expire skips OnUpdate; clean snares on the last ticks instead.
+        bool const vortexEnding = dynObj->GetDuration() <= 200;
+
+        for (uint64 guid : inside)
+        {
+            if (current.find(guid) != current.end())
+                continue;
+
+            Unit* target = ObjectAccessor::GetUnit(*dynObj, guid);
+            if (!target)
+                continue;
+
+            if (!vortexEnding && !target->HasAura(SPELL_DRUID_URSOLS_VORTEX_JUMP_DEST))
+            {
+                if (SpellInfo const* jumpInfo = sSpellMgr->GetSpellInfo(SPELL_DRUID_URSOLS_VORTEX_JUMP_DEST))
+                {
+                    if (!target->IsImmunedToSpell(jumpInfo) && !target->IsImmunedToDamage(jumpInfo)
+                        && caster->MagicSpellHitResult(target, jumpInfo) == SPELL_MISS_NONE)
+                        target->CastSpell(dynObj->GetPositionX(), dynObj->GetPositionY(), dynObj->GetPositionZ(),
+                            SPELL_DRUID_URSOLS_VORTEX_JUMP_DEST, true);
+                }
+            }
+
+            target->RemoveAurasDueToSpell(SPELL_DRUID_URSOLS_VORTEX_SNARE, caster->GetGUID());
+        }
+
+        if (vortexEnding)
+        {
+            for (uint64 guid : current)
+                if (Unit* target = ObjectAccessor::GetUnit(*dynObj, guid))
+                    target->RemoveAurasDueToSpell(SPELL_DRUID_URSOLS_VORTEX_SNARE, caster->GetGUID());
+
+            _unitsInside.erase(dynGuid);
+        }
+        else
+            inside.swap(current);
+    }
+
+private:
+    std::unordered_map<uint64, std::unordered_set<uint64>> _unitsInside;
+};
+
+// 102560 - Incarnation: Chosen of Elune
+// Applies the Arcane/Nature damage buff (122114) for the Incarnation duration.
+class spell_dru_incarnation_chosen_of_elune : public SpellScriptLoader
+{
+public:
+    spell_dru_incarnation_chosen_of_elune() : SpellScriptLoader("spell_dru_incarnation_chosen_of_elune") { }
+
+    class spell_dru_incarnation_chosen_of_elune_AuraScript : public AuraScript
+    {
+        PrepareAuraScript(spell_dru_incarnation_chosen_of_elune_AuraScript);
+
+        bool Validate(SpellInfo const* /*spellInfo*/) override
+        {
+            if (!sSpellMgr->GetSpellInfo(SPELL_DRUID_CHOSEN_OF_ELUNE_DAMAGE))
+                return false;
+            return true;
+        }
+
+        void OnApply(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
+        {
+            if (Unit* target = GetTarget())
+                target->CastSpell(target, SPELL_DRUID_CHOSEN_OF_ELUNE_DAMAGE, true);
+        }
+
+        void OnRemove(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
+        {
+            if (Unit* target = GetTarget())
+                target->RemoveAurasDueToSpell(SPELL_DRUID_CHOSEN_OF_ELUNE_DAMAGE);
+        }
+
+        void Register() override
+        {
+            OnEffectApply += AuraEffectApplyFn(spell_dru_incarnation_chosen_of_elune_AuraScript::OnApply, EFFECT_0, SPELL_AURA_DUMMY, AURA_EFFECT_HANDLE_REAL);
+            OnEffectRemove += AuraEffectRemoveFn(spell_dru_incarnation_chosen_of_elune_AuraScript::OnRemove, EFFECT_0, SPELL_AURA_DUMMY, AURA_EFFECT_HANDLE_REAL);
+        }
+    };
+
+    AuraScript* GetAuraScript() const override
+    {
+        return new spell_dru_incarnation_chosen_of_elune_AuraScript();
+    }
+};
+
+// 102543 / 102558 / 102560 - Incarnation skins
+// Enter the matching shapeshift (if needed) and refresh display to the armored model.
+class spell_dru_incarnation_skins : public SpellScriptLoader
+{
+public:
+    spell_dru_incarnation_skins() : SpellScriptLoader("spell_dru_incarnation_skins") { }
+
+    class spell_dru_incarnation_skins_AuraScript : public AuraScript
+    {
+        PrepareAuraScript(spell_dru_incarnation_skins_AuraScript);
+
+        void HandleApply(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
+        {
+            Unit* owner = GetUnitOwner();
+            if (!owner)
+                return;
+
+            uint32 formSpell = 0;
+            ShapeshiftForm neededForm = FORM_NONE;
+            switch (GetId())
+            {
+                case SPELL_DRUID_INCARNATION_KING_OF_JUNGLE:
+                    formSpell = SPELL_DRUID_CAT_FORM;
+                    neededForm = FORM_CAT;
+                    break;
+                case SPELL_DRUID_INCARNATION_SON_OF_URSOC:
+                    formSpell = SPELL_DRUID_BEAR_FORM;
+                    neededForm = FORM_BEAR;
+                    break;
+                case SPELL_DRUID_INCARNATION_CHOSEN_OF_ELUNE:
+                    formSpell = SPELL_DRUID_MOONKIN_FORM;
+                    neededForm = FORM_MOONKIN;
+                    break;
+                default:
+                    break;
+            }
+
+            if (formSpell && owner->GetShapeshiftForm() != neededForm)
+                owner->CastSpell(owner, formSpell, true);
+
+            if (uint32 model = owner->GetModelForForm(owner->GetShapeshiftForm()))
+                owner->SetDisplayId(model);
+        }
+
+        void HandleRemove(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
+        {
+            if (Unit* owner = GetUnitOwner())
+                owner->RestoreDisplayId();
+        }
+
+        void Register() override
+        {
+            OnEffectApply += AuraEffectApplyFn(spell_dru_incarnation_skins_AuraScript::HandleApply, EFFECT_0, SPELL_AURA_ANY, AURA_EFFECT_HANDLE_REAL);
+            OnEffectRemove += AuraEffectRemoveFn(spell_dru_incarnation_skins_AuraScript::HandleRemove, EFFECT_0, SPELL_AURA_ANY, AURA_EFFECT_HANDLE_REAL);
+        }
+    };
+
+    AuraScript* GetAuraScript() const override
+    {
+        return new spell_dru_incarnation_skins_AuraScript();
+    }
+};
+
+// 33891 - Incarnation: Tree of Life
+// Apply the 30s Incarnation wrapper so the form can be freely re-entered without CD.
+class spell_dru_tree_of_life : public SpellScriptLoader
+{
+public:
+    spell_dru_tree_of_life() : SpellScriptLoader("spell_dru_tree_of_life") { }
+
+    class spell_dru_tree_of_life_SpellScript : public SpellScript
+    {
+        PrepareSpellScript(spell_dru_tree_of_life_SpellScript);
+
+        bool Validate(SpellInfo const* /*spellInfo*/) override
+        {
+            if (!sSpellMgr->GetSpellInfo(SPELL_DRUID_INCARNATION_AURA))
+                return false;
+            return true;
+        }
+
+        void HandleCast()
+        {
+            Unit* caster = GetCaster();
+            if (!caster->HasAura(SPELL_DRUID_INCARNATION_AURA))
+                caster->CastSpell(caster, SPELL_DRUID_INCARNATION_AURA, true);
+        }
+
+        void Register() override
+        {
+            OnCast += SpellCastFn(spell_dru_tree_of_life_SpellScript::HandleCast);
+        }
+    };
+
+    SpellScript* GetSpellScript() const override
+    {
+        return new spell_dru_tree_of_life_SpellScript();
+    }
+};
+
+// 117679 - Incarnation (Tree of Life duration wrapper)
+// When the window ends, force-cancel Tree of Life form.
+class spell_dru_incarnation_tree_aura : public SpellScriptLoader
+{
+public:
+    spell_dru_incarnation_tree_aura() : SpellScriptLoader("spell_dru_incarnation_tree_aura") { }
+
+    class spell_dru_incarnation_tree_aura_AuraScript : public AuraScript
+    {
+        PrepareAuraScript(spell_dru_incarnation_tree_aura_AuraScript);
+
+        bool Validate(SpellInfo const* /*spellInfo*/) override
+        {
+            if (!sSpellMgr->GetSpellInfo(SPELL_DRUID_INCARNATION_TREE_OF_LIFE))
+                return false;
+            return true;
+        }
+
+        void OnRemove(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
+        {
+            if (Unit* target = GetTarget())
+                target->RemoveAurasDueToSpell(SPELL_DRUID_INCARNATION_TREE_OF_LIFE);
+        }
+
+        void Register() override
+        {
+            OnEffectRemove += AuraEffectRemoveFn(spell_dru_incarnation_tree_aura_AuraScript::OnRemove, EFFECT_0, SPELL_AURA_IGNORE_SPELL_COOLDOWN, AURA_EFFECT_HANDLE_REAL);
+        }
+    };
+
+    AuraScript* GetAuraScript() const override
+    {
+        return new spell_dru_incarnation_tree_aura_AuraScript();
+    }
+};
+
+// 102351 - Cenarion Ward
+// Dummy aura procs on damage taken; default HandleDummyAuraProc casts the heal on the
+// attacker. Redirect the HoT (102352) onto the ward bearer and consume the charge.
+class spell_dru_cenarion_ward : public SpellScriptLoader
+{
+public:
+    spell_dru_cenarion_ward() : SpellScriptLoader("spell_dru_cenarion_ward") { }
+
+    class spell_dru_cenarion_ward_AuraScript : public AuraScript
+    {
+        PrepareAuraScript(spell_dru_cenarion_ward_AuraScript);
+
+        bool Validate(SpellInfo const* /*spellInfo*/) override
+        {
+            if (!sSpellMgr->GetSpellInfo(SPELL_DRUID_CENARION_WARD_HEAL))
+                return false;
+            return true;
+        }
+
+        void HandleProc(AuraEffect const* /*aurEff*/, ProcEventInfo& /*eventInfo*/)
+        {
+            PreventDefaultAction();
+
+            Unit* caster = GetCaster();
+            Unit* target = GetTarget();
+            if (!caster || !target)
+                return;
+
+            caster->CastSpell(target, SPELL_DRUID_CENARION_WARD_HEAL, true);
+        }
+
+        void Register() override
+        {
+            OnEffectProc += AuraEffectProcFn(spell_dru_cenarion_ward_AuraScript::HandleProc, EFFECT_0, SPELL_AURA_DUMMY);
+        }
+    };
+
+    AuraScript* GetAuraScript() const override
+    {
+        return new spell_dru_cenarion_ward_AuraScript();
     }
 };
 
@@ -3244,6 +3565,12 @@ void AddSC_druid_spell_scripts()
 {
     new spell_dru_dash();
     new spell_dru_bear_hug();
+    new spell_dru_cenarion_ward();
+    new spell_dru_incarnation_chosen_of_elune();
+    new spell_dru_incarnation_skins();
+    new spell_dru_incarnation_tree_aura();
+    new spell_dru_tree_of_life();
+    new spell_dru_ursols_vortex_dynamic();
     new spell_dru_eclipse("spell_dru_eclipse_lunar");
     new spell_dru_eclipse("spell_dru_eclipse_solar");
     new spell_dru_eclipse_energize();
