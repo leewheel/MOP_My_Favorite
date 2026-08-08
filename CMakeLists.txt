@@ -68,7 +68,7 @@ endif()
 
 include(CheckPlatform)
 
-set(OPENSSL_EXPECTED_VERSION 4.0.0)
+set(OPENSSL_EXPECTED_VERSION 3.0.0)
 
 set(BOOST_EXPECTED_VERSION 1.91.0)
 

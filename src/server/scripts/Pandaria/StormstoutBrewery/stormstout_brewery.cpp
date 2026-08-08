@@ -14,7 +14,7 @@ enum Spells
     SPELL_SSB_BANANA_BAR_REMOVE = 107347
 };
 
-#define SAY_OOK_OOK_1         "Who crashing Ook party!?"
+#define SAY_OOK_OOK_1         "谁把服务器搞崩了!?"
 
 void SummonOokOokIfReady(InstanceScript* instance, Creature* creature, Unit* killer)
 {
