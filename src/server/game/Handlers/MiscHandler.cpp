@@ -1124,8 +1124,17 @@ void WorldSession::HandleSetPvP(WorldPacket& recvData)
     SetPvPRequest request = ReadSetPvPRequest(recvData);
     if (request.hasStatus)
     {
-        GetPlayer()->ApplyModFlag(PLAYER_FIELD_PLAYER_FLAGS, PLAYER_FLAGS_IN_PVP, request.newPvPStatus);
-        GetPlayer()->ApplyModFlag(PLAYER_FIELD_PLAYER_FLAGS, PLAYER_FLAGS_PVP_TIMER, !request.newPvPStatus);
+        Player* player = GetPlayer();
+        player->ApplyModFlag(PLAYER_FIELD_PLAYER_FLAGS, PLAYER_FLAGS_IN_PVP, request.newPvPStatus);
+        player->ApplyModFlag(PLAYER_FIELD_PLAYER_FLAGS, PLAYER_FLAGS_PVP_TIMER, !request.newPvPStatus);
+
+        if (request.newPvPStatus)
+        {
+            if (!player->IsPvP() || player->pvpInfo.EndTimer)
+                player->UpdatePvP(true, true);
+        }
+        else if (!player->pvpInfo.IsHostile && player->IsPvP() && !player->pvpInfo.EndTimer)
+            player->pvpInfo.EndTimer = time(NULL);
     }
 }
 void WorldSession::HandleTogglePvP(WorldPacket& /*recvData*/)
@@ -1626,35 +1635,37 @@ void WorldSession::HandleUpdateAccountData(WorldPacket& recvData)
     SF_LOG_DEBUG("network", "WORLD: Received CMSG_UPDATE_ACCOUNT_DATA");
 
     uint32 timestamp = 0, decompressedSize = 0, compCount = 0;
-    uint8 type = 0;
     recvData >> decompressedSize >> timestamp >> compCount;
 
-    std::size_t const typePosition = recvData.rpos() + compCount;
-    if (typePosition >= recvData.size())
+    auto readAccountDataType = [&recvData](AccountDataType& dataType) -> bool
     {
-        recvData.rfinish();
-        SF_LOG_DEBUG("network", "UAD: Account data packet missing type bits");
-        return;
-    }
+        if (recvData.rpos() >= recvData.size())
+        {
+            recvData.rfinish();
+            SF_LOG_DEBUG("network", "UAD: Account data packet missing type bits");
+            return false;
+        }
 
-    type = recvData[typePosition] >> 5;
-    AccountDataType UADType = AccountDataType(type);
-    if (UADType >= AccountDataType::NUM_ACCOUNT_DATA_TYPES)
-    {
-        recvData.rfinish();
-        SF_LOG_DEBUG("network", "UAD: Unknown account data type: %u", type);
-        return;
-    }
+        uint8 const type = uint8(recvData.ReadBits(3));
+        dataType = AccountDataType(type);
+        if (dataType >= AccountDataType::NUM_ACCOUNT_DATA_TYPES)
+        {
+            recvData.rfinish();
+            SF_LOG_DEBUG("network", "UAD: Unknown account data type: %u", type);
+            return false;
+        }
+
+        return true;
+    };
+
+    AccountDataType UADType = AccountDataType::NUM_ACCOUNT_DATA_TYPES;
 
     if (decompressedSize == 0)                               // erase
     {
+        if (!readAccountDataType(UADType))
+            return;
+
         SetAccountData(UADType, 0, "");
-
-        WorldPacket data(SMSG_UPDATE_ACCOUNT_DATA_COMPLETE, 4 + 4);
-        data << uint32(type);
-        data << uint32(0);
-        SendPacket(&data);
-
         return;
     }
 
@@ -1662,6 +1673,13 @@ void WorldSession::HandleUpdateAccountData(WorldPacket& recvData)
     {
         recvData.rfinish();                   // unneeded warning spam in this case
         SF_LOG_DEBUG("network", "UAD: Account data packet too big, size %u", decompressedSize);
+        return;
+    }
+
+    if (compCount > recvData.size() - recvData.rpos())
+    {
+        recvData.rfinish();
+        SF_LOG_DEBUG("network", "UAD: Account data packet too short, compressed size %u", compCount);
         return;
     }
 
@@ -1676,19 +1694,14 @@ void WorldSession::HandleUpdateAccountData(WorldPacket& recvData)
         return;
     }
 
-    recvData.rpos(recvData.rpos() + compCount);
+    std::string adata = dest.ReadString(decompressedSize);
 
-    recvData.ReadBits(3);
+    recvData.read_skip(compCount);
 
-    std::string adata;
-    dest >> adata;
+    if (!readAccountDataType(UADType))
+        return;
 
     SetAccountData(UADType, timestamp, adata);
-
-    WorldPacket data(SMSG_UPDATE_ACCOUNT_DATA_COMPLETE, 4 + 4);
-    data << uint32(UADType);
-    data << uint32(0);
-    SendPacket(&data);
 }
 
 void WorldSession::HandleRequestAccountData(WorldPacket& recvData)

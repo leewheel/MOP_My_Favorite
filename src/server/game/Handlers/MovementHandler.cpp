@@ -456,6 +456,9 @@ void WorldSession::HandleMoveTeleportAck(WorldPacket& recvPacket)
     WorldLocation const& dest = plMover->GetTeleportDest();
 
     plMover->UpdatePosition(dest, true);
+    // Near teleports can finish with the player already at dest coords; force a full
+    // visibility refresh so creates for the destination cell are sent after ACK.
+    plMover->UpdateObjectVisibility(true);
 
     uint32 newzone, newarea;
     plMover->GetZoneAndAreaId(newzone, newarea);
@@ -827,6 +830,13 @@ void WorldSession::HandleMovementForceAck(WorldPacket& recvPacket)
     SF_LOG_DEBUG("network", "%s", recvPacket.GetOpcode() == CMSG_MOVE_APPLY_MOVEMENT_FORCE_ACK ? "CMSG_MOVE_APPLY_MOVEMENT_FORCE_ACK" : "CMSG_MOVE_REMOVE_MOVEMENT_FORCE_ACK");
 
     ReadMovementForceAckRequest(GetPlayer(), recvPacket);
+}
+
+void WorldSession::HandleMoveSetCanTransitionBetweenSwimAndFlyAck(WorldPacket& recvData)
+{
+    SF_LOG_DEBUG("network", "WORLD: CMSG_MOVE_SET_CAN_TRANSITION_BETWEEN_SWIM_AND_FLY_ACK");
+
+    recvData.rfinish();
 }
 
 void WorldSession::HandleMoveSetCanTurnWhileFallingAck(WorldPacket& recvData)
