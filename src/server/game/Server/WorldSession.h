@@ -253,7 +253,9 @@ protected:
 class WorldSession
 {
 public:
-    WorldSession(uint32 id, WorldSocket* sock, AccountTypes sec, uint8 expansion, time_t mute_time, LocaleConstant locale, uint32 recruiter, bool isARecruiter, bool hasBoost, bool usedEmailLogin);
+    WorldSession(uint32 id, WorldSocket* sock, AccountTypes sec, uint8 expansion, time_t mute_time, LocaleConstant locale,
+        uint32 recruiter, bool isARecruiter, bool hasBoost, bool usedEmailLogin, bool usesAuthnetWorldHandoff,
+        std::string worldAuthLogin, SessionKey const& worldSessionKey);
     ~WorldSession();
 
     bool PlayerLoading() const { return m_playerLoading; }
@@ -280,6 +282,10 @@ public:
 
     void SendAuthResponse(ResponseCodes code, bool queued, uint32 queuePos = 0);
     void SendClientCacheVersion(uint32 version);
+    bool SendConnectToInstance();
+    bool AttachInstanceSocket(WorldSocket* socket, uint64 key);
+    void ContinuePlayerLogin();
+    void HandleQueuedMessagesEnd(WorldPacket& recvData);
     void SendFeatureSystemStatusGlueScreen();
 
     rbac::RBACData* GetRBACData();
@@ -293,6 +299,7 @@ public:
     AccountTypes GetSecurity() const { return _security; }
     uint32 GetAccountId() const { return _accountId; }
     bool UsedEmailLogin() const { return m_usedEmailLogin; }
+    bool UsesAuthnetWorldHandoff() const { return m_usesAuthnetWorldHandoff; }
     Player* GetPlayer() const { return _player; }
     std::string const& GetPlayerName() const;
     std::string GetPlayerInfo() const;
@@ -1192,7 +1199,11 @@ private:
     uint32 m_GUIDLow;                                   // set loggined or recently logout player (while m_playerRecentlyLogout set)
     Player* _player;
     WorldSocket* m_Socket;
+    WorldSocket* m_InstanceSocket;
     std::string m_Address;
+    std::string m_WorldAuthLogin;
+    SessionKey m_WorldSessionKey;
+    uint64 m_InstanceConnectKey;
 
     AccountTypes _security;
     uint32 _accountId;
@@ -1208,6 +1219,7 @@ private:
     time_t _logoutTime;
     bool m_inQueue;                                     // session wait in auth.queue
     bool m_playerLoading;                               // code processed in LoginPlayer
+    uint64 m_pendingPlayerLoginGuid;
     bool m_playerLogout;                                // code processed in LogoutPlayer
     bool m_playerRecentlyLogout;
     bool m_playerSave;
@@ -1225,6 +1237,7 @@ private:
     bool isRecruiter;
     bool m_hasBoost;
     bool m_usedEmailLogin;
+    bool m_usesAuthnetWorldHandoff;
     Skyfire::LockedQueue<WorldPacket*, Skyfire::Mutex> _recvQueue;
     time_t timeLastWhoCommand;
     z_stream_s* _compressionStream;
